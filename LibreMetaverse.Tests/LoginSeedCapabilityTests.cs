@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Net.Http;
 using System.Reflection;
 using System.Text;
+using System.Threading;
 using System.Threading.Tasks;
 using NUnit.Framework;
 
@@ -47,10 +48,13 @@ namespace LibreMetaverse.Tests
         {
             var client = new GridClient();
             var statuses = Track(client);
+            var capsFailures = 0;
+            client.Network.CapabilitiesFailed += (_, __) => Interlocked.Increment(ref capsFailures);
 
             await HandleLoginReply(client, LoginReply(seed));
 
             Assert.That(client.Network.LoginStatusCode, Is.EqualTo(LoginStatus.Failed));
+            Assert.That(capsFailures, Is.EqualTo(0), "A bad login seed is a login failure, never a CAPS failure");
             Assert.That(client.Network.LoginMessage, Is.EqualTo("Login server did not return a valid seed capability"));
             Assert.That(client.Network.LoginErrorKey, Is.EqualTo("bad seed capability"));
             Assert.That(client.Network.LoginSeedCapability, Is.Null);

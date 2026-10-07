@@ -325,25 +325,34 @@ namespace LibreMetaverse
                 }
 
                 string failure;
+                CapabilitiesFailureKind kind;
+                int? httpStatus = null;
+                string? exceptionType = null;
                 try
                 {
                     var (response, data) = await Simulator.Client.HttpCapsClient.PostAsync(_SeedCapsURI, OSDFormat.Xml, Caps.AllCapabilities, token);
+                    httpStatus = (int)response.StatusCode;
                     if (response.StatusCode == HttpStatusCode.NotFound)
                     {
-                        _seedState = SeedRequestState.Failed;
-                        Logger.Error($"Seed capability for {Simulator} returned a 404, capability system is aborting", Simulator.Client);
+                        SeedRequestFailed(token, CapabilitiesFailureKind.NotFound, attempt, httpStatus, null,
+                            $"Seed capability for {Simulator} returned a 404, capability system is aborting");
                         return;
                     }
 
                     if (!response.IsSuccessStatusCode)
                     {
+                        kind = CapabilitiesFailureKind.HttpError;
                         failure = $"HTTP {(int)response.StatusCode}";
                     }
-                    else if (TryParseSeedResponse(data, out var respMap, out failure))
+                    else if (TryParseSeedResponse(data, out var respMap, out failure, out exceptionType))
                     {
                         _seedState = SeedRequestState.Succeeded;
                         SeedRequestCompleteHandler(respMap);
                         return;
+                    }
+                    else
+                    {
+                        kind = CapabilitiesFailureKind.InvalidResponse;
                     }
                 }
                 catch (Exception ex) when (ex is OperationCanceledException || ex is ObjectDisposedException)
@@ -353,18 +362,22 @@ namespace LibreMetaverse
                         SeedRequestCancelled();
                         return;
                     }
+                    kind = CapabilitiesFailureKind.Timeout;
+                    exceptionType = ex.GetType().Name;
                     failure = "timed out"; // HttpClient.Timeout, not our token
                 }
                 catch (Exception ex)
                 {
+                    kind = CapabilitiesFailureKind.Transport;
+                    exceptionType = ex.GetType().Name;
                     failure = ex.GetType().Name;
                 }
 
                 if (attempt >= attempts)
                 {
-                    _seedState = SeedRequestState.Failed;
-                    Logger.Error($"Seed capability request for {Simulator} failed after {attempt} attempts ({failure}); " +
-                                 "capabilities are unavailable", Simulator.Client);
+                    SeedRequestFailed(token, kind, attempt, httpStatus, exceptionType,
+                        $"Seed capability request for {Simulator} failed after {attempt} attempts ({failure}); " +
+                        "capabilities are unavailable");
                     return;
                 }
 
@@ -390,12 +403,34 @@ namespace LibreMetaverse
         }
 
         /// <summary>
+        /// Terminal failure: no capabilities. Raises NetworkManager.CapabilitiesFailed once, unless
+        /// this Caps was disconnected or the client went offline meanwhile (a deliberate stop is
+        /// a cancellation, not a failure).
+        /// </summary>
+        private void SeedRequestFailed(CancellationToken token, CapabilitiesFailureKind kind, int attempts,
+            int? httpStatus, string? exceptionType, string message)
+        {
+            if (token.IsCancellationRequested || !Simulator.Client.Network.Connected)
+            {
+                SeedRequestCancelled();
+                return;
+            }
+
+            _seedState = SeedRequestState.Failed;
+            Logger.Error(message, Simulator.Client);
+            Simulator.Client.Network.RaiseCapabilitiesFailedEvent(
+                new CapabilitiesFailedEventArgs(Simulator, kind, attempts, httpStatus, exceptionType));
+        }
+
+        /// <summary>
         /// Parses a successful seed response. False, with a short reason that never includes
         /// the body (it holds capability URLs), when the body is empty, not LLSD or not a map.
         /// </summary>
-        private static bool TryParseSeedResponse(byte[]? responseData, out OSDMap respMap, out string failure)
+        private static bool TryParseSeedResponse(byte[]? responseData, out OSDMap respMap, out string failure,
+            out string? exceptionType)
         {
             respMap = null!;
+            exceptionType = null;
             if (responseData == null || responseData.Length == 0)
             {
                 failure = "empty response";
@@ -409,6 +444,7 @@ namespace LibreMetaverse
             }
             catch (Exception ex)
             {
+                exceptionType = ex.GetType().Name;
                 failure = $"invalid response ({ex.GetType().Name}, {responseData.Length} bytes)";
                 return false;
             }

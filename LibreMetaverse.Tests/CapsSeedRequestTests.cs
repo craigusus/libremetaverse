@@ -51,6 +51,7 @@ namespace LibreMetaverse.Tests
             Assert.That(seed.Caps.SeedState, Is.EqualTo(Caps.SeedRequestState.Succeeded));
             Assert.That(seed.Handler.Calls, Is.EqualTo(1));
             Assert.That(seed.Received, Is.EqualTo(1));
+            Assert.That(seed.Failures, Is.Empty);
             Assert.That(seed.Caps.CapabilityURI("GetDisplayNames"), Is.EqualTo(new Uri("https://caps.test/cap/display-names")));
             Assert.That(seed.Caps.CapabilityURI("FetchInventory2"), Is.EqualTo(new Uri("https://caps.test/cap/fetch-inventory")));
             Assert.That(seed.Handler.Methods, Is.All.EqualTo(HttpMethod.Post));
@@ -66,6 +67,7 @@ namespace LibreMetaverse.Tests
             Assert.That(seed.Caps.SeedState, Is.EqualTo(Caps.SeedRequestState.Succeeded));
             Assert.That(seed.Handler.Calls, Is.EqualTo(2));
             Assert.That(seed.Received, Is.EqualTo(1));
+            Assert.That(seed.Failures, Is.Empty);
         }
 
         [Test]
@@ -78,6 +80,7 @@ namespace LibreMetaverse.Tests
             Assert.That(seed.Caps.SeedState, Is.EqualTo(Caps.SeedRequestState.Succeeded));
             Assert.That(seed.Handler.Calls, Is.EqualTo(4));
             Assert.That(seed.Received, Is.EqualTo(1));
+            Assert.That(seed.Failures, Is.Empty);
         }
 
         [Test]
@@ -106,6 +109,7 @@ namespace LibreMetaverse.Tests
             Assert.That(seed.Caps.SeedState, Is.EqualTo(Caps.SeedRequestState.Succeeded));
             Assert.That(seed.Handler.Calls, Is.EqualTo(3));
             Assert.That(seed.Received, Is.EqualTo(1));
+            Assert.That(seed.Failures, Is.Empty);
         }
 
         [Test]
@@ -154,6 +158,7 @@ namespace LibreMetaverse.Tests
             Assert.That(seed.Caps.SeedState, Is.EqualTo(Caps.SeedRequestState.Succeeded));
             Assert.That(seed.Handler.Calls, Is.EqualTo(2));
             Assert.That(seed.Received, Is.EqualTo(1));
+            Assert.That(seed.Failures, Is.Empty);
         }
 
         [Test]
@@ -220,6 +225,7 @@ namespace LibreMetaverse.Tests
             Assert.That(seed.Caps.SeedState, Is.EqualTo(Caps.SeedRequestState.Succeeded));
             Assert.That(seed.Handler.Calls, Is.EqualTo(1));
             Assert.That(seed.Received, Is.EqualTo(1));
+            Assert.That(seed.Failures, Is.Empty);
         }
 
         [Test]
@@ -261,6 +267,7 @@ namespace LibreMetaverse.Tests
             await failing.Finish();
             AssertFailedAfter(failing, 5);
             Assert.That(healthy.Received, Is.EqualTo(1));
+            Assert.That(healthy.Failures, Is.Empty);
             Assert.That(healthy.Caps.Capabilities(), Has.Count.EqualTo(2));
             Assert.That(healthy.Handler.Calls, Is.EqualTo(1));
         }
@@ -286,6 +293,7 @@ namespace LibreMetaverse.Tests
             AssertCancelledAfter(cancelled, 1);
             Assert.That(other.Caps.SeedState, Is.EqualTo(Caps.SeedRequestState.Succeeded));
             Assert.That(other.Received, Is.EqualTo(1));
+            Assert.That(other.Failures, Is.Empty);
         }
 
         [Test]
@@ -301,12 +309,124 @@ namespace LibreMetaverse.Tests
                 Assert.That(seed.Caps.SeedState, Is.EqualTo(Caps.SeedRequestState.Succeeded));
                 Assert.That(seed.Handler.Calls, Is.EqualTo(2));
                 Assert.That(seed.Received, Is.EqualTo(1));
+            Assert.That(seed.Failures, Is.Empty);
             }
+        }
+
+        [Test]
+        public async Task FailureSignalCarriesBoundedMetadataOnly()
+        {
+            var transport = Start(Throw());
+            var serverError = Start(Respond(HttpStatusCode.BadGateway, "<html>502</html>", "text/html"));
+            var notFound = Start(Respond(HttpStatusCode.NotFound, "cap not found: '0b6c1a7e'", "text/plain"));
+            var malformed = Start(Respond(HttpStatusCode.OK, "not llsd at all", "text/plain"));
+            var empty = Start(Respond(HttpStatusCode.OK, ""));
+            var timeout = Start(NoWait, client => client.HttpCapsClient.Timeout = TimeSpan.FromMilliseconds(100), Hang());
+            await Task.WhenAll(transport.Finish(), serverError.Finish(), notFound.Finish(), malformed.Finish(),
+                empty.Finish(), timeout.Finish());
+
+            AssertFailedAfter(transport, 5);
+            AssertFailure(transport, CapabilitiesFailureKind.Transport, null, nameof(HttpRequestException));
+            AssertFailedAfter(serverError, 5);
+            AssertFailure(serverError, CapabilitiesFailureKind.HttpError, 502, null);
+            AssertFailedAfter(notFound, 1);
+            AssertFailure(notFound, CapabilitiesFailureKind.NotFound, 404, null);
+            AssertFailedAfter(malformed, 5);
+            AssertFailure(malformed, CapabilitiesFailureKind.InvalidResponse, 200, "OSDException");
+            AssertFailedAfter(empty, 5);
+            AssertFailure(empty, CapabilitiesFailureKind.InvalidResponse, 200, null);
+            AssertFailedAfter(timeout, 5);
+            Assert.That(timeout.Failures[0].Kind, Is.EqualTo(CapabilitiesFailureKind.Timeout));
+            Assert.That(timeout.Failures[0].HttpStatus, Is.Null);
+
+            // Only names and numbers: nothing that could carry the seed or a capability URL.
+            var strings = typeof(CapabilitiesFailedEventArgs).GetProperties()
+                .Where(property => property.PropertyType == typeof(string)).Select(property => property.Name);
+            Assert.That(strings, Is.EquivalentTo(new[] { nameof(CapabilitiesFailedEventArgs.ExceptionType) }));
+        }
+
+        [Test]
+        public async Task NoFailureSignalWhenDisconnectedDuringTheLastAttempt()
+        {
+            // The last attempt fails just as the client goes offline (a deliberate logout):
+            // a cancellation, never a terminal failure.
+            Seed seed = null;
+            seed = Start(Throw(), Throw(), Throw(), Throw(), (request, token) =>
+            {
+                SetConnected(seed.Client, false);
+                throw new HttpRequestException("simulated connection reset");
+            });
+            await seed.Finish();
+
+            AssertCancelledAfter(seed, 5);
+        }
+
+        [Test]
+        public async Task NoFailureSignalWhenClientDisconnectsAsA404Arrives()
+        {
+            // A 404 that arrives as the client goes offline (logout) is not a failure either.
+            Seed seed = null;
+            seed = Start((request, token) =>
+            {
+                SetConnected(seed.Client, false);
+                return Task.FromResult(Response(HttpStatusCode.NotFound, "cap not found", "text/plain"));
+            });
+            await seed.Finish();
+
+            AssertCancelledAfter(seed, 1);
+        }
+
+        [Test]
+        public async Task NoFailureSignalWhenCapsDisconnectedDuringTheRequest()
+        {
+            Seed seed = null;
+            seed = Start((request, token) =>
+            {
+                seed.Caps.Disconnect(true);
+                return Task.FromResult(Response(HttpStatusCode.NotFound, "cap not found", "text/plain"));
+            });
+            await seed.Finish();
+
+            AssertCancelledAfter(seed, 1);
+        }
+
+        [Test]
+        public async Task ThrowingFailureSubscriberDoesNotRetryOrRepeat()
+        {
+            var seed = Start(Respond(HttpStatusCode.NotFound, "cap not found", "text/plain"));
+            seed.Client.Network.CapabilitiesFailed += (_, __) => throw new InvalidOperationException("subscriber failure");
+            await seed.Finish();
+
+            AssertFailedAfter(seed, 1);
+        }
+
+        [Test]
+        public async Task FailureSignalGoesOnlyToTheFailingClient()
+        {
+            var failing = Start(Throw());
+            var healthy = Start(Respond(HttpStatusCode.OK, SuccessBody));
+            await Task.WhenAll(failing.Finish(), healthy.Finish());
+
+            AssertFailedAfter(failing, 5);
+            Assert.That(healthy.Caps.SeedState, Is.EqualTo(Caps.SeedRequestState.Succeeded));
+            Assert.That(healthy.Failures, Is.Empty);
+            Assert.That(healthy.Received, Is.EqualTo(1));
+        }
+
+        private static void AssertFailure(Seed seed, CapabilitiesFailureKind kind, int? status, string exceptionType)
+        {
+            var failure = seed.Failures.Single();
+            Assert.That(failure.Kind, Is.EqualTo(kind));
+            Assert.That(failure.HttpStatus, Is.EqualTo(status));
+            Assert.That(failure.ExceptionType, Is.EqualTo(exceptionType));
         }
 
         private static void AssertFailedAfter(Seed seed, int attempts)
         {
             Assert.That(seed.Caps.SeedState, Is.EqualTo(Caps.SeedRequestState.Failed));
+            Assert.That(seed.Failures, Has.Count.EqualTo(1), "CapabilitiesFailed must be raised exactly once");
+            Assert.That(seed.Failures[0].Simulator, Is.SameAs(seed.Caps.Simulator));
+            Assert.That(seed.Failures[0].Attempts, Is.EqualTo(attempts));
             Assert.That(seed.Handler.Calls, Is.EqualTo(attempts));
             Assert.That(seed.Received, Is.EqualTo(0));
             Assert.That(seed.Caps.Capabilities(), Is.Empty);
@@ -325,6 +445,7 @@ namespace LibreMetaverse.Tests
         private static void AssertCancelledAfter(Seed seed, int attempts)
         {
             Assert.That(seed.Caps.SeedState, Is.EqualTo(Caps.SeedRequestState.Cancelled));
+            Assert.That(seed.Failures, Is.Empty, "A cancellation is not a failure");
             Assert.That(seed.Handler.Calls, Is.EqualTo(attempts));
             Assert.That(seed.Received, Is.EqualTo(0));
             Assert.That(seed.Caps.Capabilities(), Is.Empty);
@@ -342,6 +463,8 @@ namespace LibreMetaverse.Tests
             private int _received;
             public int Received => Volatile.Read(ref _received);
             public void OnReceived() => Interlocked.Increment(ref _received);
+            public readonly List<CapabilitiesFailedEventArgs> Failures = new List<CapabilitiesFailedEventArgs>();
+            public void OnFailed(CapabilitiesFailedEventArgs e) { lock (Failures) Failures.Add(e); }
             public Task Finish() => Bounded(Caps.SeedRequest);
         }
 
@@ -353,6 +476,7 @@ namespace LibreMetaverse.Tests
             var client = NewClient(handler, connected: true);
             configure?.Invoke(client);
             var seed = new Seed { Client = client, Handler = handler };
+            client.Network.CapabilitiesFailed += (_, e) => seed.OnFailed(e);
             // The first attempt waits for the subscription below, so no event can be missed.
             seed.Caps = new Caps(NewSimulator(client), SeedUri, waits);
             seed.Caps.CapabilitiesReceived += (_, __) => seed.OnReceived();

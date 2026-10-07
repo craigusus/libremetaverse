@@ -292,6 +292,28 @@ namespace LibreMetaverse
             remove { lock (m_EventQueueRunningLock) { m_EventQueueRunning -= value; } }
         }
 
+        private EventHandler<CapabilitiesFailedEventArgs>? m_CapabilitiesFailed;
+
+        ///<summary>Raises the CapabilitiesFailed Event</summary>
+        /// <param name="e">A CapabilitiesFailedEventArgs object describing the terminal failure</param>
+        protected virtual void OnCapabilitiesFailed(CapabilitiesFailedEventArgs e)
+        {
+            EventHandler<CapabilitiesFailedEventArgs>? handler = m_CapabilitiesFailed;
+            handler?.Invoke(this, e);
+        }
+
+        /// <summary>Thread sync lock object</summary>
+        private readonly object m_CapabilitiesFailedLock = new object();
+
+        /// <summary>Raised once when a simulator's seed capability request fails for good (a 404,
+        /// or every attempt failed): that simulator has no capabilities and no event queue.
+        /// Never raised on success or when the request is cancelled by a disconnect.</summary>
+        public event EventHandler<CapabilitiesFailedEventArgs> CapabilitiesFailed
+        {
+            add { lock (m_CapabilitiesFailedLock) { m_CapabilitiesFailed += value; } }
+            remove { lock (m_CapabilitiesFailedLock) { m_CapabilitiesFailed -= value; } }
+        }
+
         private EventHandler<GenericStreamingMessageEventArgs>? m_GenericStreamingMessage;
 
         ///<summary>Raises the GenericStreamingMessage Event</summary>
@@ -1075,6 +1097,24 @@ namespace LibreMetaverse
             }
         }
 
+        /// <summary>
+        /// Fire an event when a simulator's seed capability request fails for good. A throwing
+        /// subscriber is logged and never affects the caller.
+        /// </summary>
+        internal void RaiseCapabilitiesFailedEvent(CapabilitiesFailedEventArgs e)
+        {
+            if (m_CapabilitiesFailed == null) { return; }
+
+            try
+            {
+                OnCapabilitiesFailed(e);
+            }
+            catch (Exception ex)
+            {
+                Logger.Error("CapabilitiesFailed event handler exception", ex, Client);
+            }
+        }
+
         private async Task OutgoingPacketHandler(CancellationToken ct)
         {
             if (_packetOutbox == null)
@@ -1630,6 +1670,49 @@ namespace LibreMetaverse
         public EventQueueRunningEventArgs(Simulator simulator)
         {
             Simulator = simulator;
+        }
+    }
+
+    /// <summary>What ended a simulator's seed capability request without capabilities</summary>
+    public enum CapabilitiesFailureKind
+    {
+        /// <summary>The seed capability answered 404 (terminal at once)</summary>
+        NotFound,
+        /// <summary>Every attempt failed; the last returned another non-success HTTP status</summary>
+        HttpError,
+        /// <summary>Every attempt failed; the last failed in transport</summary>
+        Transport,
+        /// <summary>Every attempt failed; the last timed out</summary>
+        Timeout,
+        /// <summary>Every attempt failed; the last returned an empty, unparseable or non-map body</summary>
+        InvalidResponse
+    }
+
+    /// <summary>
+    /// A terminal seed capability failure. Bounded metadata only: never the seed or capability
+    /// URLs, the response body or exception messages.
+    /// </summary>
+    public class CapabilitiesFailedEventArgs : EventArgs
+    {
+        /// <summary>Simulator whose capabilities could not be set up</summary>
+        public Simulator Simulator { get; }
+        /// <summary>The terminal failure, or the last attempt's when every attempt failed</summary>
+        public CapabilitiesFailureKind Kind { get; }
+        /// <summary>Attempts made, including the last</summary>
+        public int Attempts { get; }
+        /// <summary>The last attempt's HTTP status, when it had a response</summary>
+        public int? HttpStatus { get; }
+        /// <summary>The last attempt's exception type name, when it had one</summary>
+        public string? ExceptionType { get; }
+
+        public CapabilitiesFailedEventArgs(Simulator simulator, CapabilitiesFailureKind kind, int attempts,
+            int? httpStatus, string? exceptionType)
+        {
+            Simulator = simulator;
+            Kind = kind;
+            Attempts = attempts;
+            HttpStatus = httpStatus;
+            ExceptionType = exceptionType;
         }
     }
 
