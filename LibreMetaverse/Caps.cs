@@ -66,6 +66,24 @@ namespace LibreMetaverse
         private readonly CancellationTokenSource _HttpCts = new CancellationTokenSource();
         private EventQueueClient? _EventQueueClient = null;
 
+        /// <summary>Outcome of the seed capability request</summary>
+        internal enum SeedRequestState { Pending, Succeeded, Failed, Cancelled }
+
+        /// <summary>Waits between seed request attempts: five attempts in total</summary>
+        internal static readonly TimeSpan[] DefaultSeedRetryDelays =
+        {
+            TimeSpan.FromSeconds(1), TimeSpan.FromSeconds(2), TimeSpan.FromSeconds(4), TimeSpan.FromSeconds(8)
+        };
+
+        private readonly TimeSpan[] _seedRetryDelays;
+        private volatile SeedRequestState _seedState = SeedRequestState.Pending;
+
+        /// <summary>Outcome of the seed capability request; Failed or Cancelled means no capabilities</summary>
+        internal SeedRequestState SeedState => _seedState;
+
+        /// <summary>The seed request; it always completes without throwing</summary>
+        internal Task SeedRequest { get; }
+
         /// <summary>Capabilities URI this system was initialized with</summary>
         public Uri SeedCapsURI => _SeedCapsURI;
 
@@ -81,11 +99,20 @@ namespace LibreMetaverse
         /// <param name="simulator"></param>
         /// <param name="seedcaps"></param>
         internal Caps(Simulator simulator, Uri seedcaps)
+            : this(simulator, seedcaps, DefaultSeedRetryDelays)
+        {
+        }
+
+        /// <param name="simulator"></param>
+        /// <param name="seedcaps"></param>
+        /// <param name="seedRetryDelays">Waits between seed request attempts (tests use short ones)</param>
+        internal Caps(Simulator simulator, Uri seedcaps, TimeSpan[] seedRetryDelays)
         {
             Simulator = simulator;
             _SeedCapsURI = seedcaps;
+            _seedRetryDelays = seedRetryDelays;
 
-            _ = MakeSeedRequestAsync();
+            SeedRequest = MakeSeedRequestAsync();
         }
 
         public void Disconnect(bool immediate)
@@ -265,81 +292,179 @@ namespace LibreMetaverse
             "InventoryAPIv3",
             "LibraryAPIv3"
         };
+        /// <summary>
+        /// Requests the seed capability. Attempts run in a loop (never recursively), at most
+        /// one more than there are retry delays. A 404 ends the request at once; a transport
+        /// failure, timeout, other non-success status or unusable body is retried after the
+        /// next delay. Cancellation (Disconnect) or a client disconnect ends it quietly.
+        /// Capabilities are applied, and CapabilitiesReceived raised, only on success.
+        /// </summary>
         private async Task MakeSeedRequestAsync()
         {
-            if (Simulator == null || !Simulator.Client.Network.Connected) { return; }
-
-            try
+            if (Simulator == null || !Simulator.Client.Network.Connected)
             {
-                var (response, data) = await Simulator.Client.HttpCapsClient.PostAsync(_SeedCapsURI, OSDFormat.Xml, Caps.AllCapabilities, _HttpCts.Token);
-                SeedRequestCompleteHandler(response, data, null);
-            }
-            catch (Exception ex)
-            {
-                SeedRequestCompleteHandler(null, null, ex);
-            }
-        }
-
-        private void SeedRequestCompleteHandler(HttpResponseMessage? response, byte[]? responseData, Exception? error)
-        {
-            if (error != null)
-            {
-                if (response != null && response.StatusCode == HttpStatusCode.NotFound)
-                {
-                    Logger.Error("Seed capability returned a 404, capability system is aborting");
-                }
-                else
-                {
-                    Logger.Warn($"Seed capability returned {(response == null ? "no response" : response.StatusCode.ToString())}. Trying again.");
-                    // Retry the seed request after disposing/renewing the previous CTS to avoid using canceled token
-                    DisposalHelper.SafeCancelAndDispose(_HttpCts, (m, e) => { if (e != null) Logger.Debug(m, e); else Logger.Debug(m); });
-                    // Create a fresh CTS for retry
-                    // Note: _HttpCts is readonly, so we cannot reassign; instead, call MakeSeedRequest only if the original CTS hasn't been disposed.
-                    _ = MakeSeedRequestAsync();
-                }
+                _seedState = SeedRequestState.Cancelled;
                 return;
             }
 
-            try
+            CancellationToken token;
+            try { token = _HttpCts.Token; }
+            catch (ObjectDisposedException)
             {
-                if (responseData == null) return;
-                OSD result = OSDParser.Deserialize(responseData);
-                if (result is OSDMap respMap)
+                _seedState = SeedRequestState.Cancelled;
+                return;
+            }
+
+            var attempts = _seedRetryDelays.Length + 1;
+            for (var attempt = 1; ; attempt++)
+            {
+                if (token.IsCancellationRequested || !Simulator.Client.Network.Connected)
                 {
-                    foreach (var cap in respMap.Keys)
+                    SeedRequestCancelled();
+                    return;
+                }
+
+                string failure;
+                try
+                {
+                    var (response, data) = await Simulator.Client.HttpCapsClient.PostAsync(_SeedCapsURI, OSDFormat.Xml, Caps.AllCapabilities, token);
+                    if (response.StatusCode == HttpStatusCode.NotFound)
                     {
-                        var maybeUri = respMap[cap]?.AsUri();
-                        if (maybeUri != null)
-                        {
-                            _Caps[cap] = maybeUri;
-                            Simulator.Client.CapsRateLimiter.RegisterCapUri(cap, maybeUri);
-                        }
+                        _seedState = SeedRequestState.Failed;
+                        Logger.Error($"Seed capability for {Simulator} returned a 404, capability system is aborting", Simulator.Client);
+                        return;
                     }
 
-                    if (_Caps.TryGetValue("EventQueueGet", out var eventQueueGetCap))
+                    if (!response.IsSuccessStatusCode)
                     {
-                        Logger.Trace($"Starting event queue for {Simulator}", Simulator.Client);
-
-                        _EventQueueClient = new EventQueueClient(eventQueueGetCap, Simulator);
-                        _EventQueueClient.OnConnected += EventQueueConnectedHandler;
-                        _EventQueueClient.OnEvent += EventQueueEventHandler;
-                        _EventQueueClient.Start();
+                        failure = $"HTTP {(int)response.StatusCode}";
                     }
-
-                    if (_Caps.TryGetValue("SimulatorFeatures", out var simFeaturesCap))
+                    else if (TryParseSeedResponse(data, out var respMap, out failure))
                     {
-                        Logger.Trace($"Retrieving Simulator Features for {Simulator}", Simulator.Client);
-                        Simulator.Features = new SimulatorFeatures(Simulator);
-                        _ = FetchSimulatorFeaturesAsync(simFeaturesCap);
+                        _seedState = SeedRequestState.Succeeded;
+                        SeedRequestCompleteHandler(respMap);
+                        return;
                     }
+                }
+                catch (Exception ex) when (ex is OperationCanceledException || ex is ObjectDisposedException)
+                {
+                    if (token.IsCancellationRequested || ex is ObjectDisposedException)
+                    {
+                        SeedRequestCancelled();
+                        return;
+                    }
+                    failure = "timed out"; // HttpClient.Timeout, not our token
+                }
+                catch (Exception ex)
+                {
+                    failure = ex.GetType().Name;
+                }
 
-                    OnCapabilitiesReceived(Simulator);
+                if (attempt >= attempts)
+                {
+                    _seedState = SeedRequestState.Failed;
+                    Logger.Error($"Seed capability request for {Simulator} failed after {attempt} attempts ({failure}); " +
+                                 "capabilities are unavailable", Simulator.Client);
+                    return;
+                }
+
+                var delay = _seedRetryDelays[attempt - 1];
+                Logger.Warn($"Seed capability request for {Simulator} failed (attempt {attempt} of {attempts}: {failure}); " +
+                            $"retrying in {delay.TotalSeconds:0.###} s", Simulator.Client);
+                try
+                {
+                    await Task.Delay(delay, token);
+                }
+                catch (Exception ex) when (ex is OperationCanceledException || ex is ObjectDisposedException)
+                {
+                    SeedRequestCancelled();
+                    return;
                 }
             }
-            catch (System.Text.Json.JsonException)
+        }
+
+        private void SeedRequestCancelled()
+        {
+            _seedState = SeedRequestState.Cancelled;
+            Logger.Debug($"Seed capability request for {Simulator} stopped: disconnected", Simulator.Client);
+        }
+
+        /// <summary>
+        /// Parses a successful seed response. False, with a short reason that never includes
+        /// the body (it holds capability URLs), when the body is empty, not LLSD or not a map.
+        /// </summary>
+        private static bool TryParseSeedResponse(byte[]? responseData, out OSDMap respMap, out string failure)
+        {
+            respMap = null!;
+            if (responseData == null || responseData.Length == 0)
             {
-                var respText = responseData != null ? System.Text.Encoding.UTF8.GetString(responseData) : string.Empty;
-                Logger.Warn($"Invalid caps response; '{respText}' for seed request.", Simulator.Client);
+                failure = "empty response";
+                return false;
+            }
+
+            OSD result;
+            try
+            {
+                result = OSDParser.Deserialize(responseData);
+            }
+            catch (Exception ex)
+            {
+                failure = $"invalid response ({ex.GetType().Name}, {responseData.Length} bytes)";
+                return false;
+            }
+
+            if (result is OSDMap map)
+            {
+                respMap = map;
+                failure = string.Empty;
+                return true;
+            }
+
+            failure = $"invalid response ({result?.Type.ToString() ?? "null"}, {responseData.Length} bytes)";
+            return false;
+        }
+
+        /// <summary>
+        /// Applies a parsed seed response: registers the capabilities, starts the event queue
+        /// and simulator features, then raises CapabilitiesReceived. Runs at most once per
+        /// Caps; a failure here is logged and never retried.
+        /// </summary>
+        private void SeedRequestCompleteHandler(OSDMap respMap)
+        {
+            try
+            {
+                foreach (var cap in respMap.Keys)
+                {
+                    var maybeUri = respMap[cap]?.AsUri();
+                    if (maybeUri != null)
+                    {
+                        _Caps[cap] = maybeUri;
+                        Simulator.Client.CapsRateLimiter.RegisterCapUri(cap, maybeUri);
+                    }
+                }
+
+                if (_Caps.TryGetValue("EventQueueGet", out var eventQueueGetCap))
+                {
+                    Logger.Trace($"Starting event queue for {Simulator}", Simulator.Client);
+
+                    _EventQueueClient = new EventQueueClient(eventQueueGetCap, Simulator);
+                    _EventQueueClient.OnConnected += EventQueueConnectedHandler;
+                    _EventQueueClient.OnEvent += EventQueueEventHandler;
+                    _EventQueueClient.Start();
+                }
+
+                if (_Caps.TryGetValue("SimulatorFeatures", out var simFeaturesCap))
+                {
+                    Logger.Trace($"Retrieving Simulator Features for {Simulator}", Simulator.Client);
+                    Simulator.Features = new SimulatorFeatures(Simulator);
+                    _ = FetchSimulatorFeaturesAsync(simFeaturesCap);
+                }
+
+                OnCapabilitiesReceived(Simulator);
+            }
+            catch (Exception ex)
+            {
+                Logger.Error($"Error applying seed capability response for {Simulator}", ex, Simulator.Client);
             }
         }
 
