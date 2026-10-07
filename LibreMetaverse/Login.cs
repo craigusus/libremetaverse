@@ -703,7 +703,7 @@ namespace LibreMetaverse
 
             Client.Network.CircuitCode = (uint)response.CircuitCode;
 
-            LoginSeedCapability = !string.IsNullOrEmpty(response.SeedCapability) ? new Uri(response.SeedCapability) : null;
+            LoginSeedCapability = ParseSeedCapability(response.SeedCapability);
 
             var handle = Utils.UIntsToLong(response.RegionX, response.RegionY);
 
@@ -720,6 +720,20 @@ namespace LibreMetaverse
                 UpdateLoginStatus(LoginStatus.Failed, "Unable to connect to simulator");
                 return false;
             }
+        }
+
+        /// <summary>
+        /// The seed capability from a login reply as an absolute http(s) URI, or null when it is
+        /// missing, blank or invalid (some login replies carry an empty seed_capability).
+        /// </summary>
+        internal static Uri? ParseSeedCapability(string? seedCapability)
+        {
+            if (string.IsNullOrWhiteSpace(seedCapability)) { return null; }
+
+            return Uri.TryCreate(seedCapability, UriKind.Absolute, out var uri)
+                   && (uri.Scheme == Uri.UriSchemeHttps || uri.Scheme == Uri.UriSchemeHttp)
+                ? uri
+                : null;
         }
 
         public void BeginLogin(LoginParams loginParams)
@@ -1225,34 +1239,44 @@ namespace LibreMetaverse
                         // These parameters are stored in NetworkManager, so instead of registering
                         // another callback for them we just set the values here
                         CircuitCode = (uint)data.CircuitCode;
-                        LoginSeedCapability = new Uri(data.SeedCapability);
+                        LoginSeedCapability = ParseSeedCapability(data.SeedCapability);
 
-                        UpdateLoginStatus(LoginStatus.ConnectingToSim, "Connecting to simulator...");
-
-                        var handle = Utils.UIntsToLong(data.RegionX, data.RegionY);
-
-                        if (data.SimIP != null && data.SimPort != 0)
+                        if (LoginSeedCapability == null)
                         {
-                            // Connect to the sim given in the login reply
-                            if (Connect(data.SimIP, data.SimPort, handle, true, LoginSeedCapability,
-                                    data.RegionSizeX, data.RegionSizeY) != null)
-                            {
-                                // Request the economy data right after login
-                                SendPacket(new EconomyDataRequestPacket());
+                            // Never connect, or set up CAPS, without a usable seed capability; never guess one
+                            LoginErrorKey = "bad seed capability";
+                            Logger.Error("Login reply did not contain a valid seed capability", Client);
+                            UpdateLoginStatus(LoginStatus.Failed, "Login server did not return a valid seed capability");
+                        }
+                        else
+                        {
+                            UpdateLoginStatus(LoginStatus.ConnectingToSim, "Connecting to simulator...");
 
-                                // Update the login message with the MOTD returned from the server
-                                UpdateLoginStatus(LoginStatus.Success, data.Message);
+                            var handle = Utils.UIntsToLong(data.RegionX, data.RegionY);
+
+                            if (data.SimIP != null && data.SimPort != 0)
+                            {
+                                // Connect to the sim given in the login reply
+                                if (Connect(data.SimIP, data.SimPort, handle, true, LoginSeedCapability,
+                                        data.RegionSizeX, data.RegionSizeY) != null)
+                                {
+                                    // Request the economy data right after login
+                                    SendPacket(new EconomyDataRequestPacket());
+
+                                    // Update the login message with the MOTD returned from the server
+                                    UpdateLoginStatus(LoginStatus.Success, data.Message);
+                                }
+                                else
+                                {
+                                    UpdateLoginStatus(LoginStatus.Failed,
+                                        "Unable to establish a UDP connection to the simulator");
+                                }
                             }
                             else
                             {
                                 UpdateLoginStatus(LoginStatus.Failed,
-                                    "Unable to establish a UDP connection to the simulator");
+                                    "Login server did not return a simulator address");
                             }
-                        }
-                        else
-                        {
-                            UpdateLoginStatus(LoginStatus.Failed,
-                                "Login server did not return a simulator address");
                         }
                     }
                     else
