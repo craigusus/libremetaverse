@@ -669,7 +669,8 @@ namespace LibreMetaverse
             }
             catch (Exception ex)
             {
-                Logger.Warn($"Failed to fetch asset {assetID}: {ex}", Client);
+                // The exception type only: its message or stack may carry the ViewerAsset capability URL.
+                Logger.Warn($"Failed to fetch asset {assetID}; exception={ex.GetType().Name}", Client);
                 if (callback != null)
                 {
                     transfer.Success = false;
@@ -900,7 +901,8 @@ namespace LibreMetaverse
             }
             catch (Exception ex)
             {
-                Logger.Warn($"Failed to fetch asset {assetID}: {ex}", Client);
+                // The exception type only: its message or stack may carry the ViewerAsset capability URL.
+                Logger.Warn($"Failed to fetch asset {assetID}; exception={ex.GetType().Name}", Client);
                 if (callback != null)
                 {
                     transfer.Success = false;

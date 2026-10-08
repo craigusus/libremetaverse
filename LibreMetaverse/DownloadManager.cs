@@ -292,7 +292,8 @@ namespace LibreMetaverse.Http
                             {
                                 sw.Stop();
                                 try {
-                                    Logger.Trace($"Download completed {addr} attempts={representative.Attempt} status={(int)response.StatusCode} bytes={responseData?.Length ?? 0} time={sw.ElapsedMilliseconds}ms");
+                                    // Never the request address: for an asset it is a capability URL (a session secret).
+                                    Logger.Trace($"Asset download finished; status={(int)response.StatusCode}; attempts={representative.Attempt}; bytes={responseData?.Length ?? 0}; exception={finalError?.GetType().Name ?? "none"}; time={sw.ElapsedMilliseconds}ms");
                                 } catch { }
 
                                 var handlers = activeDownload.CompletedHandlers.ToArray();
@@ -321,7 +322,7 @@ namespace LibreMetaverse.Http
                             {
                                 // Transient error -> retry
                                 representative.Attempt++;
-                                Logger.Warn($"{representative.Address} HTTP download failed, trying again retry {representative.Attempt}/{representative.Retries}");
+                                Logger.Warn($"Asset download failed; status={(int)response.StatusCode}; retry={representative.Attempt}/{representative.Retries}");
 
                                 // Dispose response before retry/backoff
                                 try { response.Dispose(); } catch { }
@@ -331,7 +332,7 @@ namespace LibreMetaverse.Http
                                 try { await Task.Delay(delay + jitter, activeDownload.CancellationToken.Token).ConfigureAwait(false); } catch { }
 
                                 sw.Stop();
-                                try { Logger.Debug($"Download failed {addr} attempts={representative.Attempt} error={finalError?.Message ?? "status"} time={sw.ElapsedMilliseconds}ms"); } catch { }
+                                try { Logger.Debug($"Asset download failed; status={(int)response.StatusCode}; attempts={representative.Attempt}; exception={finalError?.GetType().Name ?? "none"}; time={sw.ElapsedMilliseconds}ms"); } catch { }
 
                                 // Requeue the representative for another attempt
                                 queue.Enqueue(representative);
@@ -361,13 +362,14 @@ namespace LibreMetaverse.Http
                         if (representative.Attempt < representative.Retries)
                         {
                             representative.Attempt++;
-                            Logger.Warn($"{representative.Address} HTTP download exception, retry {representative.Attempt}/{representative.Retries}: {ex}");
+                            // The exception type only: its message or stack may carry the request address.
+                            Logger.Warn($"Asset download exception; retry={representative.Attempt}/{representative.Retries}; exception={ex.GetType().Name}");
                             try { response?.Dispose(); } catch { }
                             var delay = Math.Min(2000, 200 * representative.Attempt);
                             var jitter = new Random().Next(0, 200);
                             try { await Task.Delay(delay + jitter, activeDownload.CancellationToken.Token).ConfigureAwait(false); } catch { }
 
-                            try { Logger.Debug($"Download exception {addr} attempts={representative.Attempt} error={ex.Message}"); } catch { }
+                            try { Logger.Debug($"Asset download exception; attempts={representative.Attempt}; exception={ex.GetType().Name}"); } catch { }
 
                             queue.Enqueue(representative);
                             EnqueuePending();
