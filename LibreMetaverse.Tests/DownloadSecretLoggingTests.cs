@@ -68,17 +68,19 @@ namespace LibreMetaverse.Tests
         }
 
         // ---- The downloader ------------------------------------------------------------------------
-        // A retryable failure logs its retry, then (an existing downloader behaviour this logging-only
-        // change leaves alone) the requeued attempt never runs and the caller's task never completes;
-        // so retry paths are checked by their log lines, not by completion.
+        // Every retry path completes (DownloadRetryTests covers the retry lifecycle itself).
 
         [Test]
         public async Task RetryableServerError()
         {
             var handler = new Scripted(_ => Status(HttpStatusCode.ServiceUnavailable));
-            Start(handler, retries: 2);
-            await LoggedAsync("Asset download failed; status=503; retry=1/2").ConfigureAwait(false);
-            await LoggedAsync("Asset download failed; status=503; attempts=1; exception=HttpRequestException").ConfigureAwait(false);
+            var error = await DownloadFails(handler, retries: 2).ConfigureAwait(false);
+            Assert.That(error, Is.InstanceOf<HttpRequestException>());
+            Assert.That(handler.Calls, Is.EqualTo(3));
+            AssertLogged("Asset download failed; status=503; retry=1/2");
+            AssertLogged("Asset download failed; status=503; retry=2/2");
+            AssertLogged("Asset download failed; status=503; attempts=1; exception=HttpRequestException");
+            AssertLogged("Asset download finished; status=503; attempts=2; bytes=0; exception=HttpRequestException");
             AssertNoSecrets();
         }
 
@@ -100,9 +102,12 @@ namespace LibreMetaverse.Tests
         {
             // An exception whose message holds the full address must not reach the log through its text.
             var handler = new Scripted(_ => throw new HttpRequestException($"Connection reset while requesting {SecretUri}"));
-            Start(handler, retries: 2);
-            await LoggedAsync("Asset download exception; retry=1/2; exception=HttpRequestException").ConfigureAwait(false);
-            await LoggedAsync("Asset download exception; attempts=1; exception=HttpRequestException").ConfigureAwait(false);
+            var error = await DownloadFails(handler, retries: 2).ConfigureAwait(false);
+            Assert.That(error, Is.InstanceOf<HttpRequestException>());
+            Assert.That(handler.Calls, Is.EqualTo(3));
+            AssertLogged("Asset download exception; retry=1/2; exception=HttpRequestException");
+            AssertLogged("Asset download exception; retry=2/2; exception=HttpRequestException");
+            AssertLogged("Asset download exception; attempts=1; exception=HttpRequestException");
             AssertNoSecrets();
         }
 
@@ -110,9 +115,11 @@ namespace LibreMetaverse.Tests
         public async Task TimeoutException()
         {
             var handler = new Scripted(_ => throw new TimeoutException($"The operation on {SecretUri} timed out"));
-            Start(handler, retries: 1);
-            await LoggedAsync("Asset download exception; retry=1/1; exception=TimeoutException").ConfigureAwait(false);
-            await LoggedAsync("Asset download exception; attempts=1; exception=TimeoutException").ConfigureAwait(false);
+            var error = await DownloadFails(handler, retries: 1).ConfigureAwait(false);
+            Assert.That(error, Is.InstanceOf<TimeoutException>());
+            Assert.That(handler.Calls, Is.EqualTo(2));
+            AssertLogged("Asset download exception; retry=1/1; exception=TimeoutException");
+            AssertLogged("Asset download exception; attempts=1; exception=TimeoutException");
             AssertNoSecrets();
         }
 
@@ -131,9 +138,11 @@ namespace LibreMetaverse.Tests
         public async Task BodyReadFailureCarryingTheAddress()
         {
             var handler = new Scripted(_ => new HttpResponseMessage(HttpStatusCode.OK) { Content = new StreamContent(new ThrowingStream($"Stream reset for {SecretUri}")) });
-            Start(handler, retries: 1);
-            await LoggedAsync("Asset download failed; status=200; retry=1/1").ConfigureAwait(false);
-            await LoggedAsync("Asset download failed; status=200; attempts=1; exception=IOException").ConfigureAwait(false);
+            var error = await DownloadFails(handler, retries: 1).ConfigureAwait(false);
+            Assert.That(error, Is.InstanceOf<IOException>());
+            Assert.That(handler.Calls, Is.EqualTo(2));
+            AssertLogged("Asset download failed; status=200; retry=1/1");
+            AssertLogged("Asset download failed; status=200; attempts=1; exception=IOException");
             AssertNoSecrets();
         }
 
@@ -163,8 +172,11 @@ namespace LibreMetaverse.Tests
         public async Task InventoryLandmarkAssetServerError()
         {
             var client = SeededClient(_ => Status(HttpStatusCode.ServiceUnavailable));
-            _ = client.Assets.RequestInventoryAssetAsync(UUID.Random(), UUID.Random(), UUID.Zero, UUID.Random(),
-                AssetType.Landmark, true, UUID.Random(), CancellationToken.None);
+            // All 6 attempts (5 retries, real backoff) fail; the request then completes with no asset.
+            var asset = await Within(client.Assets.RequestInventoryAssetAsync(UUID.Random(), UUID.Random(), UUID.Zero, UUID.Random(),
+                AssetType.Landmark, true, UUID.Random(), CancellationToken.None)).ConfigureAwait(false);
+            Assert.That(asset, Is.Null);
+            AssertLogged("Failed to fetch asset ");
             await LoggedAsync("Asset download failed; status=503; retry=1/5").ConfigureAwait(false);
             await LoggedAsync("Asset download failed; status=503; attempts=1; exception=HttpRequestException").ConfigureAwait(false);
             AssertNoSecrets();
@@ -174,8 +186,11 @@ namespace LibreMetaverse.Tests
         public async Task InventoryLandmarkAssetTransportException()
         {
             var client = SeededClient(request => throw new HttpRequestException($"Socket error for {request.RequestUri}"));
-            _ = client.Assets.RequestInventoryAssetAsync(UUID.Random(), UUID.Random(), UUID.Zero, UUID.Random(),
-                AssetType.Landmark, true, UUID.Random(), CancellationToken.None);
+            // All 6 attempts (5 retries, real backoff) fail; the request then completes with no asset.
+            var asset = await Within(client.Assets.RequestInventoryAssetAsync(UUID.Random(), UUID.Random(), UUID.Zero, UUID.Random(),
+                AssetType.Landmark, true, UUID.Random(), CancellationToken.None)).ConfigureAwait(false);
+            Assert.That(asset, Is.Null);
+            AssertLogged("Failed to fetch asset ");
             await LoggedAsync("Asset download exception; retry=1/5; exception=HttpRequestException").ConfigureAwait(false);
             await LoggedAsync("Asset download exception; attempts=1; exception=HttpRequestException").ConfigureAwait(false);
             AssertNoSecrets();
@@ -258,14 +273,6 @@ namespace LibreMetaverse.Tests
         {
             Assert.That(_capture.Lines.Any(l => l.IndexOf(fragment, StringComparison.Ordinal) >= 0), Is.True,
                 "Missing diagnostic '" + fragment + "' in:\n" + string.Join("\n", _capture.Lines));
-        }
-
-        // Queues a download whose task is not awaited (a retry path never completes it).
-        private void Start(Scripted handler, int retries)
-        {
-            var downloads = new DownloadManager(NewClient(handler));
-            _downloads.Add(downloads);
-            _ = downloads.QueueDownloadAsync(SecretUri, null, null, CancellationToken.None, retries: retries);
         }
 
         private async Task LoggedAsync(string fragment)

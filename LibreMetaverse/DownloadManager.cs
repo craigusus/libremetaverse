@@ -84,6 +84,10 @@ namespace LibreMetaverse.Http
         private readonly ConcurrentDictionary<string, ActiveDownload> activeDownloads = new ConcurrentDictionary<string, ActiveDownload>();
         private readonly ConcurrentDictionary<string, SemaphoreSlim> hostSemaphores = new ConcurrentDictionary<string, SemaphoreSlim>();
 
+        // Tests only: downloads in progress (one entry per address) and requests waiting for a slot.
+        internal int ActiveCount => activeDownloads.Count;
+        internal int QueuedCount => queue.Count;
+
         /// <summary>Maximum number of parallel downloads from a single endpoint</summary>
         public int ParallelDownloads { get; set; }
 
@@ -201,6 +205,10 @@ namespace LibreMetaverse.Http
 
                     try
                     {
+                        // A cancelled download sends nothing more (a retry waits out its backoff first).
+                        if (activeDownload.CancellationToken.IsCancellationRequested)
+                            throw new OperationCanceledException();
+
                         var sw = Stopwatch.StartNew();
 
                         using (var request = new HttpRequestMessage(HttpMethod.Get, addr))
@@ -334,12 +342,11 @@ namespace LibreMetaverse.Http
                                 sw.Stop();
                                 try { Logger.Debug($"Asset download failed; status={(int)response.StatusCode}; attempts={representative.Attempt}; exception={finalError?.GetType().Name ?? "none"}; time={sw.ElapsedMilliseconds}ms"); } catch { }
 
-                                // Requeue the representative for another attempt
-                                queue.Enqueue(representative);
-                                EnqueuePending();
-
-                                // Break here; the requeued item will be processed again by EnqueuePending
-                                break;
+                                // Retry within this loop: the same active download, its waiting callers
+                                // and its host slot. (Requeueing attached the request to this still-
+                                // registered, already-started entry, which was then removed: the retry
+                                // never ran and every caller waited forever.)
+                                continue;
                             }
                         }
                     }
@@ -371,10 +378,8 @@ namespace LibreMetaverse.Http
 
                             try { Logger.Debug($"Asset download exception; attempts={representative.Attempt}; exception={ex.GetType().Name}"); } catch { }
 
-                            queue.Enqueue(representative);
-                            EnqueuePending();
-
-                            break;
+                            // Retry within this loop (see the status retry above).
+                            continue;
                         }
 
                         var handlers = activeDownload.CompletedHandlers.ToArray();
